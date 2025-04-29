@@ -1,0 +1,2 @@
+dna_100k.csv filter=lfs diff=lfs merge=lfs -text
+next_gen_dna_nn_model.pth filter=lfs diff=lfs merge=lfs -text
