@@ -1,155 +1,70 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import pandas as pd
 import torch
-import torch.nn as nn
-import random
-from collections import Counter
+import pandas as pd
+import numpy as np
 
-# -----------------------------
-# MODEL ARCHITECTURES
-# -----------------------------
+# --- Model Definitions ---
 
-class DNA_Generator(nn.Module):
-    def __init__(self):
+class GeneratorModel(torch.nn.Module):
+    def __init__(self, input_size=48000):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(46 * 2, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 1000 * 4)  # Output shape: (4000,)
-        )
+        self.fc1 = torch.nn.Linear(input_size, 128)
+        self.fc2 = torch.nn.Linear(128, 64)
+        self.fc3 = torch.nn.Linear(64, 48)
 
     def forward(self, x):
-        return self.net(x)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
-class SymptomChecker(nn.Module):
+class SymptomClassifier(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(1000 * 4, 512),
-            nn.ReLU(),
-            nn.Linear(512, 10),  # Output: 10 gene probabilities
-            nn.Sigmoid()
-        )
+        self.fc = torch.nn.Linear(48, 10)
 
     def forward(self, x):
-        return self.net(x)
+        return torch.sigmoid(self.fc(x))
 
-# -----------------------------
-# CONSTANTS
-# -----------------------------
+# --- DNA Encoding ---
+def encode_dna_sequence(seq):
+    base_map = {"A": [1, 0, 0, 0], "C": [0, 1, 0, 0], "G": [0, 0, 1, 0], "T": [0, 0, 0, 1]}
+    return [base_map.get(base, [0, 0, 0, 0]) for base in seq]
 
-GENES = ["DISC1", "TCF4", "BDNF", "DRD2", "COMT", "GRIN2B", "NRG1", "RELN", "DTNBP1", "HTR2A"]
+def load_parent_dna(file_path):
+    df = pd.read_csv(file_path)
+    chromosome_cols = [col for col in df.columns if 'Chromosome' in col and not col.startswith("Child")]
+    data = df.iloc[0][chromosome_cols]
+    one_hot_encoded = [b for seq in data for b in encode_dna_sequence(seq)]
+    one_hot_array = np.array(one_hot_encoded, dtype=np.float32).flatten()
+    return torch.tensor(one_hot_array, dtype=torch.float32).unsqueeze(0)
 
-# -----------------------------
-# LOAD MODELS
-# -----------------------------
+# --- Load Models ---
+def load_models(input_tensor_shape):
+    input_size = input_tensor_shape[1]
+    generator = GeneratorModel(input_size=input_size)
+    generator.load_state_dict(torch.load("next_gen_dna_nn_model.pth", map_location="cpu"))
+    generator.eval()
 
-dna_model = DNA_Generator()
-dna_model.load_state_dict(torch.load("next_gen_dna_nn_model.pth", map_location="cpu"))
-dna_model.eval()
+    classifier = SymptomClassifier()
+    classifier.load_state_dict(torch.load("checker.pth", map_location="cpu"))
+    classifier.eval()
+    return generator, classifier
 
-checker_model = SymptomChecker()
-checker_model.load_state_dict(torch.load("checker.pth", map_location="cpu"))
-checker_model.eval()
+# --- Run Prediction ---
+def run_prediction(file_path):
+    parent_tensor = load_parent_dna(file_path)
+    generator, classifier = load_models(parent_tensor.shape)
 
-# -----------------------------
-# GUI SETUP
-# -----------------------------
+    for i in range(100):
+        child = generator(parent_tensor)
+        prediction = classifier(child)
+        prediction_np = prediction.squeeze().detach().numpy()
+        print(f"Child {i+1}: {np.round(prediction_np, 3)}")
 
-root = tk.Tk()
-root.title("DNA Generator & Symptom Checker")
+# --- Entry Point ---
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python dna_predict_cli.py path/to/input.csv")
+        sys.exit(1)
 
-# -----------------------------
-# FILE LOADING
-# -----------------------------
-
-def load_file():
-    file_path = filedialog.askopenfilename(
-        title="Select Parent DNA CSV",
-        filetypes=[("CSV files", "*.csv")]
-    )
-    if not file_path:
-        return
-
-    try:
-        df = pd.read_csv(file_path)
-        messagebox.showinfo("Loaded", f"{len(df)} row(s) loaded.")
-        start_prediction(df)
-    except Exception as e:
-        messagebox.showerror("Error", str(e))
-
-# -----------------------------
-# DNA GENERATION
-# -----------------------------
-
-def generate_dna_sequences(parents_df, count=100):
-    dna_outputs = []
-
-    for _ in range(count):
-        row = parents_df.sample(1).iloc[0]
-        parent1 = row[2:46].values  # Chromosomes 1–22, X, Y (parent1)
-        parent2 = row[48:92].values  # Chromosomes 1–22, X, Y (parent2)
-
-        input_tensor = torch.tensor(list(parent1) + list(parent2), dtype=torch.float32)
-        output = dna_model(input_tensor)  # Shape: [4000]
-        one_hot = output.view(1000, 4)    # Shape: [1000, 4]
-
-        probs = one_hot.softmax(dim=1)    # Apply softmax across ACGT
-        sampled = torch.multinomial(probs, num_samples=1).squeeze()
-        dna_string = ''.join(['ACGT'[i] for i in sampled.tolist()])
-        dna_outputs.append((dna_string, probs.flatten()))
-
-    return dna_outputs
-
-# -----------------------------
-# SYMPTOM CHECKING
-# -----------------------------
-
-def check_symptoms(flat_dna_probs_list):
-    results = []
-    for prob_vector in flat_dna_probs_list:
-        pred = checker_model(prob_vector)
-        binary = (pred > 0.5).int().tolist()
-        results.append(dict(zip(GENES, binary)))
-    return results
-
-def calculate_symptom_percentages(results):
-    gene_counts = Counter()
-    total = len(results)
-    for r in results:
-        for gene, flag in r.items():
-            gene_counts[gene] += flag
-    return {gene: gene_counts[gene] / total * 100 for gene in GENES}
-
-# -----------------------------
-# RESULT DISPLAY
-# -----------------------------
-
-def display_percentages(percentages):
-    win = tk.Toplevel()
-    win.title("Symptom Detection Summary")
-    tk.Label(win, text="Gene", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=10)
-    tk.Label(win, text="Detected in (%)", font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=10)
-
-    for i, (gene, pct) in enumerate(sorted(percentages.items()), start=1):
-        tk.Label(win, text=gene).grid(row=i, column=0, sticky='w', padx=10)
-        tk.Label(win, text=f"{pct:.1f}%").grid(row=i, column=1, sticky='e', padx=10)
-
-# -----------------------------
-# MAIN PIPELINE
-# -----------------------------
-
-def start_prediction(parents_df):
-    generated = generate_dna_sequences(parents_df)
-    sequences, flat_probs = zip(*generated)
-    results = check_symptoms(flat_probs)
-    percentages = calculate_symptom_percentages(results)
-    display_percentages(percentages)
-
-# -----------------------------
-# MAIN WINDOW
-# -----------------------------
-
-tk.Button(root, text="Load Parent DNA CSV", command=load_file, padx=20, pady=10).pack(pady=30)
-root.mainloop()
+    run_prediction(sys.argv[1])
